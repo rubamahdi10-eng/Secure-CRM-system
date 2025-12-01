@@ -8,7 +8,7 @@ class Config:
     # Database
     DATABASE_URL = os.getenv(
         "DATABASE_URL",
-        "postgresql://youruni_8cov_user:NkYjhP4TVRuMZzNd2GhLkRUprI8JOKVc@dpg-d48cigodl3ps73bak9u0-a.oregon-postgres.render.com:5432/youruni_8cov",
+        "postgresql://ruba_user_user:QjdycF5qnTzplwGuDXHdNNtmuK0ZuI2m@dpg-d4gmvaumcj7s73bhat9g-a.singapore-postgres.render.com/ruba_user",
     )
 
     # JWT
