@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register - YourUni Student Management System</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="auth-container">
+        <div class="auth-card">
+            <div class="auth-header">
+                <h1>YourUni</h1>
+                <p>Create your student account</p>
+            </div>
+
+            <div id="alert-container"></div>
+
+            <form id="registerForm">
+                <div class="form-group">
+                    <label for="full_name">Full Name</label>
+                    <input type="text" id="full_name" class="form-control" placeholder="Enter your full name" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" class="form-control" placeholder="Enter your email" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <div style="position: relative;">
+                        <input type="password" id="password" class="form-control" placeholder="Create a password" required minlength="6" style="padding-right: 45px;" oninput="checkPasswordStrength()">
+                        <button type="button" onclick="togglePassword('password', 'toggleIcon1')" style="position: absolute; right: 10px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; padding: 5px; color: #92400e;">
+                            <span id="toggleIcon1">👁️</span>
+                        </button>
+                    </div>
+                    <div id="passwordStrength" style="margin-top: 8px; display: none;">
+                        <div style="display: flex; gap: 4px; margin-bottom: 5px;">
+                            <div id="strength-bar-1" style="height: 4px; flex: 1; background: #e5e7eb; border-radius: 2px; transition: all 0.3s;"></div>
+                            <div id="strength-bar-2" style="height: 4px; flex: 1; background: #e5e7eb; border-radius: 2px; transition: all 0.3s;"></div>
+                            <div id="strength-bar-3" style="height: 4px; flex: 1; background: #e5e7eb; border-radius: 2px; transition: all 0.3s;"></div>
+                            <div id="strength-bar-4" style="height: 4px; flex: 1; background: #e5e7eb; border-radius: 2px; transition: all 0.3s;"></div>
+                        </div>
+                        <div id="strength-text" style="font-size: 12px; font-weight: 600;"></div>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="confirm_password">Confirm Password</label>
+                    <div style="position: relative;">
+                        <input type="password" id="confirm_password" class="form-control" placeholder="Confirm your password" required minlength="6" style="padding-right: 45px;">
+                        <button type="button" onclick="togglePassword('confirm_password', 'toggleIcon2')" style="position: absolute; right: 10px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; padding: 5px; color: #92400e;">
+                            <span id="toggleIcon2">👁️</span>
+                        </button>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn btn-primary">
+                    <span id="btnText">Register</span>
+                    <span id="btnLoading" class="loading hidden"></span>
+                </button>
+            </form>
+
+            <div class="auth-footer">
+                <p>Already have an account? <a href="/login">Login here</a></p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function togglePassword(inputId, iconId) {
+            const passwordInput = document.getElementById(inputId);
+            const toggleIcon = document.getElementById(iconId);
+            
+            if (passwordInput.type === 'password') {
+                passwordInput.type = 'text';
+                toggleIcon.textContent = '🙈';
+            } else {
+                passwordInput.type = 'password';
+                toggleIcon.textContent = '👁️';
+            }
+        }
+
+        function checkPasswordStrength() {
+            const password = document.getElementById('password').value;
+            const strengthContainer = document.getElementById('passwordStrength');
+            const strengthText = document.getElementById('strength-text');
+            const bars = [
+                document.getElementById('strength-bar-1'),
+                document.getElementById('strength-bar-2'),
+                document.getElementById('strength-bar-3'),
+                document.getElementById('strength-bar-4')
+            ];
+
+            if (password.length === 0) {
+                strengthContainer.style.display = 'none';
+                return;
+            }
+
+            strengthContainer.style.display = 'block';
+
+            let strength = 0;
+            
+            // Length check
+            if (password.length >= 8) strength++;
+            if (password.length >= 12) strength++;
+            
+            // Complexity checks
+            if (/[a-z]/.test(password) && /[A-Z]/.test(password)) strength++;
+            if (/[0-9]/.test(password)) strength++;
+            if (/[^a-zA-Z0-9]/.test(password)) strength++;
+
+            // Cap at 4
+            strength = Math.min(strength, 4);
+
+            // Reset all bars
+            bars.forEach(bar => bar.style.background = '#e5e7eb');
+
+            // Update bars and text based on strength
+            if (strength === 1) {
+                bars[0].style.background = '#ef4444';
+                strengthText.textContent = 'Weak';
+                strengthText.style.color = '#ef4444';
+            } else if (strength === 2) {
+                bars[0].style.background = '#f59e0b';
+                bars[1].style.background = '#f59e0b';
+                strengthText.textContent = 'Fair';
+                strengthText.style.color = '#f59e0b';
+            } else if (strength === 3) {
+                bars[0].style.background = '#fbbf24';
+                bars[1].style.background = '#fbbf24';
+                bars[2].style.background = '#fbbf24';
+                strengthText.textContent = 'Good';
+                strengthText.style.color = '#fbbf24';
+            } else if (strength === 4) {
+                bars[0].style.background = '#10b981';
+                bars[1].style.background = '#10b981';
+                bars[2].style.background = '#10b981';
+                bars[3].style.background = '#10b981';
+                strengthText.textContent = 'Strong';
+                strengthText.style.color = '#10b981';
+            }
+        }
+    </script>
+    <script src="/static/js/auth.js"></script>
+</body>
+</html>
