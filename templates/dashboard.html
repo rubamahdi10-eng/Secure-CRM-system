@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - YourUni</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body class="dashboard-container">
+    <!-- Vertical Sidebar Navigation -->
+    <nav class="navbar">
+        <div class="navbar-brand">
+            YourUni
+        </div>
+        
+        <div class="navbar-user-info">
+            <div id="welcomeMessage">Welcome Admin</div>
+            <span id="userName">User</span>
+        </div>
+        
+        <div class="navbar-menu">
+            <a href="#" id="dashboardLink" class="navbar-menu-item">Dashboard</a>
+            <a href="#" id="applicationsLink" class="navbar-menu-item hidden">Applications</a>
+            <a href="#" id="documentsLink" class="navbar-menu-item hidden">Documents</a>
+            <a href="#" id="studentsLink" class="navbar-menu-item hidden">Students</a>
+            <a href="#" id="usersLink" class="navbar-menu-item hidden">User Role</a>
+            <a href="#" id="universitiesLink" class="navbar-menu-item hidden">Universities</a>
+            <a href="#" id="logisticsLink" class="navbar-menu-item hidden">Logistics</a>
+            <a href="#" id="auditLink" class="navbar-menu-item hidden">Audit Logs</a>
+        </div>
+
+        <div class="navbar-bottom">
+            <a href="#" id="messagesLink" class="navbar-menu-item hidden">💬 Chat</a>
+            <div class="notification-badge" id="notificationBell">
+                🔔
+                <span class="badge hidden" id="notificationCount">0</span>
+            </div>
+            <button class="btn btn-sm btn-secondary" onclick="logout()">Logout</button>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <div class="page-header">
+            <h1 id="pageTitle">Dashboard</h1>
+            <p id="pageSubtitle">Welcome back!</p>
+        </div>
+
+        <!-- Loading Overlay -->
+        <div class="loading-overlay" id="loadingOverlay">
+            <div class="spinner"></div>
+        </div>
+
+        <!-- Dashboard Content -->
+        <div id="dashboardContent">
+            <!-- Stats Grid -->
+            <div class="stats-grid" id="statsGrid"></div>
+
+            <!-- Main Content Area -->
+            <div id="mainContentArea"></div>
+        </div>
+    </div>
+
+    <!-- Notifications Modal -->
+    <div class="modal" id="notificationsModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Notifications</h2>
+                <button class="close-modal" onclick="closeModal('notificationsModal')">&times;</button>
+            </div>
+            <div id="notificationsList"></div>
+        </div>
+    </div>
+
+    <!-- Generic Modal -->
+    <div class="modal" id="genericModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modalTitle">Modal</h2>
+                <button class="close-modal" onclick="closeModal('genericModal')">&times;</button>
+            </div>
+            <div id="modalBody"></div>
+            <div class="modal-footer" id="modalFooter"></div>
+        </div>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
