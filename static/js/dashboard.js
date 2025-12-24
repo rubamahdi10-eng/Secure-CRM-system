@@ -1822,7 +1822,7 @@ async function showStudentDetail(studentId) {
                             <small>Status: <span class="badge badge-info">${a.status}</span></small>
                         </div>
                         <button class="btn btn-sm btn-success" onclick="showDocumentUploadFormForApplication(${a.application_id}, '${a.university_name}')">
-                            Upload Document
+                            Upload Required Documents
                         </button>
                     </div>
                 </div>
