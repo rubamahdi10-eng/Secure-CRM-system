@@ -2818,23 +2818,23 @@ async function submitProfileForm() {
 
 // Document Upload
 async function showDocumentUploadForm() {
-    // First, fetch student's applications
     showLoading();
     const data = await apiRequest('/applications');
     showLoading(false);
-    
+
     const applications = data?.applications || [];
-    
+
     if (applications.length === 0) {
         showAlert('Please create an application first before uploading documents.', 'warning');
         return;
     }
-    
-    document.getElementById('modalTitle').textContent = 'Upload Document';
+
+    document.getElementById('modalTitle').textContent = 'Upload Documents';
     document.getElementById('modalBody').innerHTML = `
         <form id="documentForm" enctype="multipart/form-data">
+
             <div class="form-group">
-                <label>Application <span style="color: red;">*</span></label>
+                <label>Application <span style="color:red">*</span></label>
                 <select name="application_id" class="form-control" required>
                     <option value="">Select application...</option>
                     ${applications.map(app => `
@@ -2844,59 +2844,34 @@ async function showDocumentUploadForm() {
                     `).join('')}
                 </select>
             </div>
+
             <div class="form-group">
-                <label>Document Type</label>
-                <select name="doc_type" class="form-control" required>
-                    <option value="">Select type...</option>
-                    <option value="Passport">Passport</option>
-                    <option value="Transcript">Academic Transcript</option>
-                    <option value="English Test">English Test Results</option>
-                    <option value="Personal Photo">Personal Photo</option>
-                    <option value="Other">Other</option>
-                </select>
+                <label>Upload Required Documents</label>
+                <input 
+                    type="file" 
+                    name="files" 
+                    class="form-control" 
+                    multiple 
+                    required
+                    accept=".pdf,.jpg,.jpeg,.png"
+                >
+                <small>
+                    Please upload all required documents at once:
+                    Passport, Transcript, English Test, Personal Photo
+                </small>
             </div>
-            <p>Please upload all required documents (Passport, Transcript, English Test, Personal Photo).</p>
-            </div>
+
         </form>
     `;
+
     document.getElementById('modalFooter').innerHTML = `
         <button class="btn btn-secondary" onclick="closeModal('genericModal')">Cancel</button>
         <button class="btn btn-primary" onclick="submitDocumentForm()">Upload</button>
     `;
+
     openModal('genericModal');
 }
 
-async function submitDocumentForm() {
-    const form = document.getElementById('documentForm');
-    const formData = new FormData(form);
-    
-    showLoading();
-    const token = getToken();
-    
-    try {
-        const response = await fetch(`${API_URL}/documents/upload`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${token}`
-            },
-            body: formData
-        });
-        
-        const data = await response.json();
-        
-        if (response.ok) {
-            closeModal('genericModal');
-            showAlert('Document uploaded successfully!', 'success');
-            await loadDocumentsPage();
-        } else {
-            showAlert(data.error || 'Upload failed');
-        }
-    } catch (error) {
-        showAlert('Upload failed');
-    }
-    
-    showLoading(false);
-}
 
 // Document Upload for Specific Application
 function showDocumentUploadFormForApplication(applicationId, universityName) {
