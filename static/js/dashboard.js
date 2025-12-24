@@ -2855,9 +2855,7 @@ async function showDocumentUploadForm() {
                     <option value="Other">Other</option>
                 </select>
             </div>
-            <div class="form-group">
-                <label>File</label>
-                <input type="file" name="file" class="form-control" multiple required>
+            <p>Please upload all required documents (Passport, Transcript, English Test, Personal Photo).</p>
             </div>
         </form>
     `;
