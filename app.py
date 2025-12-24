@@ -2830,10 +2830,10 @@ def upload_document():
             return jsonify({"error": "Student profile not found"}), 404
 
         # Get file from request
-        if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
+        files = request.files.getlist("files")
 
-        file = request.files["file"]
+if not files or len(files) == 0:
+    return jsonify({"error": "No files provided"}), 400
         doc_type = request.form.get("doc_type")
         application_id = request.form.get(
             "application_id"
@@ -2856,10 +2856,25 @@ def upload_document():
             return jsonify({"error": "Application not found or access denied"}), 404
 
         # Read file content
-        file_content = file.read()
+        for file in files:
+    file_content = file.read()
 
-        # Encrypt document
-        encrypted_data, iv = encryption_service.encrypt_document(file_content)
+    encrypted_data, iv = encryption_service.encrypt_document(file_content)
+
+    db.execute_one(
+        """INSERT INTO documents 
+           (student_id, uploaded_by, doc_type, encrypted_blob, iv, key_version, application_id, verified)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, NULL)""",
+        (
+            student["student_id"],
+            request.user_id,
+            doc_type,
+            encrypted_data,
+            iv,
+            "v1",
+            application_id,
+        ),
+    )
 
         # Store in database with application_id
         document = db.execute_one(
