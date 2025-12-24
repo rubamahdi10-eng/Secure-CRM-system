@@ -2857,7 +2857,7 @@ async function showDocumentUploadForm() {
             </div>
             <div class="form-group">
                 <label>File</label>
-                <input type="file" name="file" class="form-control" required>
+                <input type="file" name="file" class="form-control" multiple required>
             </div>
         </form>
     `;
