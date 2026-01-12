@@ -2999,7 +2999,7 @@ def get_documents():
                 fetch=False,
             )
         except Exception:
-            pass  # Columns may already exist
+            logger.warning("Database columns already exist or migration step skipped")
 
         if request.role_id == 6:  # Student
             student = db.execute_one(
@@ -3295,7 +3295,7 @@ def upload_document():
                 fetch=False,
             )
         except Exception:
-            pass  # Column may already exist
+            logger.warning("Database column already exists or migration step skipped")
 
         # Process and store all files
         uploaded_documents = []
@@ -3589,8 +3589,7 @@ def verify_document(document_id):
                 fetch=False,
             )
         except Exception:
-            # ignore DDL errors if any
-            pass
+            logger.warning("Database columns already exist or migration step skipped")
 
         # Two-stage verification:
         # Stage 1: Counsellor/Manager/SuperAdmin verifies (verified column)
