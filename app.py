@@ -14,6 +14,7 @@ from auth import auth_service, token_required, role_required
 from encryption import encryption_service
 from email_service import email_service
 from network_utils import get_local_ip, print_network_info, get_client_ip
+from validators import validator, ValidationError
 import logging
 import base64
 from datetime import datetime
@@ -98,6 +99,18 @@ def login():
             logger.error("Login failed: Missing email or password")
             return jsonify({"error": "Email and password required"}), 400
 
+        # Validate email format
+        is_valid, error_msg = validator.validate_email(email)
+        if not is_valid:
+            logger.warning(f"Login failed: Invalid email format - {error_msg}")
+            return jsonify({"error": error_msg}), 400
+
+        # Check for malicious patterns in password
+        is_safe, pattern = validator.detect_malicious_patterns(password)
+        if not is_safe:
+            logger.warning(f"Login failed: Suspicious pattern detected - {pattern}")
+            return jsonify({"error": "Suspicious input detected"}), 400
+
         # Get user from database
         user = db.execute_one(
             "SELECT user_id, email, password_hash, role_id, full_name, is_active FROM users WHERE LOWER(email) = LOWER(%s)",
@@ -111,7 +124,9 @@ def login():
             return jsonify({"error": "Account is inactive"}), 401
 
         # Verify password
-        if not auth_service.verify_password(password, user["password_hash"]):
+        password_valid = auth_service.verify_password(password, user["password_hash"])
+        
+        if not password_valid:
             # Get role name for audit
             role = db.execute_one(
                 "SELECT role_name FROM roles WHERE role_id = %s", (user["role_id"],)
@@ -134,6 +149,18 @@ def login():
                 fetch=False,
             )
             return jsonify({"error": "Invalid credentials"}), 401
+
+        # Password migration: Upgrade legacy SHA-256 hashes to bcrypt
+        # This ensures all passwords are eventually migrated to secure hashing
+        if auth_service.is_legacy_hash(user["password_hash"]):
+            logger.info(f"Migrating password hash for user {user['user_id']} from SHA-256 to bcrypt")
+            new_password_hash = auth_service.hash_password(password)
+            db.execute_query(
+                "UPDATE users SET password_hash = %s, updated_at = NOW() WHERE user_id = %s",
+                (new_password_hash, user["user_id"]),
+                fetch=False,
+            )
+            logger.info(f"Password hash successfully migrated for user {user['user_id']}")
 
         # Generate JWT token
         token = auth_service.generate_token(user["user_id"], user["role_id"])
@@ -199,6 +226,22 @@ def register():
 
         if not all([full_name, email, password]):
             return jsonify({"error": "All fields required"}), 400
+
+        # Validate and sanitize full_name
+        is_valid, error_msg = validator.validate_name(full_name)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
+        full_name = validator.sanitize_text(full_name, max_length=100)
+
+        # Validate email format
+        is_valid, error_msg = validator.validate_email(email)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
+
+        # Validate password strength
+        is_valid, error_msg = validator.validate_password(password, min_length=8)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
 
         # Check if email already exists
         existing = db.execute_one(
@@ -401,6 +444,11 @@ def reset_password():
         if not token or not new_password:
             return jsonify({"error": "Token and password required"}), 400
 
+        # Validate password strength
+        is_valid, error_msg = validator.validate_password(new_password, min_length=8)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
+
         # Verify token
         payload = auth_service.verify_token(token)
         if not payload:
@@ -475,6 +523,78 @@ def reset_password():
         return jsonify({"error": "Password reset failed"}), 500
 
 
+@app.route("/api/test-email", methods=["POST"])
+@token_required
+@role_required(1, 2)  # Manager only
+def test_email():
+    """Test email configuration"""
+    try:
+        from email_service import EmailService
+        from config import Config
+        
+        # Get test email from request or use current user's email
+        data = request.json or {}
+        test_email = data.get("email")
+        
+        if not test_email:
+            user = db.execute_one(
+                "SELECT email FROM users WHERE user_id = %s",
+                (request.user_id,)
+            )
+            test_email = user["email"] if user else None
+        
+        if not test_email:
+            return jsonify({"error": "No email address provided"}), 400
+        
+        # Validate configuration
+        is_valid, errors = EmailService.validate_config()
+        if not is_valid:
+            return jsonify({
+                "status": "Configuration Error",
+                "errors": errors,
+                "config_check": {
+                    "SMTP_HOST": Config.SMTP_HOST or "NOT SET",
+                    "SMTP_PORT": Config.SMTP_PORT or "NOT SET",
+                    "SMTP_USER": Config.SMTP_USER or "NOT SET",
+                    "SMTP_PASS": "***" + (Config.SMTP_PASS[-4:] if Config.SMTP_PASS and len(Config.SMTP_PASS) > 4 else "****"),
+                    "FROM_EMAIL": Config.FROM_EMAIL or "NOT SET",
+                    "FROM_NAME": Config.FROM_NAME or "NOT SET"
+                }
+            }), 400
+        
+        # Send test email
+        subject = "Test Email - YourUni System"
+        body_html = """
+        <html>
+            <body style="font-family: Arial, sans-serif;">
+                <h2>Test Email</h2>
+                <p>This is a test email from YourUni system.</p>
+                <p>If you received this, your email configuration is working correctly!</p>
+            </body>
+        </html>
+        """
+        body_text = "This is a test email from YourUni system."
+        
+        result = EmailService.send_email(test_email, subject, body_html, body_text)
+        
+        return jsonify({
+            "status": "success" if result else "failed",
+            "message": f"Test email {'initiated' if result else 'failed to initiate'} for {test_email}",
+            "note": "Check server logs for detailed email sending status",
+            "config": {
+                "SMTP_HOST": Config.SMTP_HOST,
+                "SMTP_PORT": Config.SMTP_PORT,
+                "SMTP_USER": Config.SMTP_USER,
+                "FROM_EMAIL": Config.FROM_EMAIL
+            }
+        }), 200
+            
+    except Exception as e:
+        logger.error(f"Test email error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== DASHBOARD ROUTES ====================
 # ==================== DASHBOARD ROUTES ====================
 
 
@@ -520,9 +640,9 @@ def get_current_user():
 
 @app.route("/api/users", methods=["GET"])
 @token_required
-@role_required(1, 2)  # Manager, Admin
+@role_required(1, 2)  # SuperAdmin, Manager
 def get_all_users():
-    """Get all users - Manager sees all, Admin sees all except Managers. Supports filtering by role."""
+    """Get all users - Manager sees all except SuperAdmins. Supports filtering by role."""
     try:
         # Get optional role filter from query params
         role_filter = request.args.get(
@@ -550,7 +670,7 @@ def get_all_users():
                        JOIN roles r ON u.role_id = r.role_id
                        ORDER BY u.created_at DESC"""
                 )
-        else:  # Admin (role_id = 2) - can see all users EXCEPT SuperAdmins
+        else:  # Manager (role_id = 2) - can see all users EXCEPT SuperAdmins
             if role_filter:
                 users = db.execute_query(
                     """SELECT u.user_id, u.full_name, u.email, u.is_active, u.email_verified,
@@ -591,9 +711,9 @@ def get_all_users():
 
 @app.route("/api/users", methods=["POST"])
 @token_required
-@role_required(1, 2)  # Manager, Admin
+@role_required(1, 2)  # SuperAdmin, Manager
 def create_user():
-    """Create new user (Admin only)"""
+    """Create new user (Manager only)"""
     try:
         data = request.json
         full_name = data.get("full_name")
@@ -604,6 +724,22 @@ def create_user():
 
         if not all([full_name, email, password, role_id]):
             return jsonify({"error": "All fields required"}), 400
+
+        # Validate and sanitize full_name
+        is_valid, error_msg = validator.validate_name(full_name)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
+        full_name = validator.sanitize_text(full_name, max_length=100)
+
+        # Validate email format
+        is_valid, error_msg = validator.validate_email(email)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
+
+        # Validate password strength
+        is_valid, error_msg = validator.validate_password(password, min_length=8)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
 
         # Convert role_id to int for comparison
         try:
@@ -704,6 +840,41 @@ def create_user():
             fetch=False,
         )
 
+        # If Student (role_id = 6), create student profile with provided data
+        if role_id == 6:
+            student = db.execute_one(
+                """INSERT INTO students (user_id, dob, nationality, phone, program_interest, 
+                                        preferred_country, education_level, notes, application_status)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING student_id""",
+                (
+                    user["user_id"],
+                    data.get("dob"),
+                    data.get("nationality"),
+                    data.get("phone"),
+                    data.get("program_interest"),
+                    data.get("preferred_country"),
+                    data.get("education_level"),
+                    data.get("notes"),
+                    "Incomplete Profile",
+                ),
+            )
+            
+            # Log student profile creation
+            db.execute_query(
+                """INSERT INTO audit_logs (user_id, action, target_table, target_id, ip_address, details)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (
+                    request.user_id,
+                    "Create Student Profile",
+                    "students",
+                    student["student_id"],
+                    get_client_ip(request),
+                    f"Student profile created for user {user['user_id']} ({full_name})",
+                ),
+                fetch=False,
+            )
+
         # Send welcome email
         email_service.send_welcome_email(
             email, full_name, role["role_name"] if role else "User"
@@ -718,7 +889,7 @@ def create_user():
 
 @app.route("/api/users/<int:user_id>/toggle-status", methods=["PUT"])
 @token_required
-@role_required(1, 2)  # Manager, Admin
+@role_required(1, 2)  # SuperAdmin, Manager
 def toggle_user_status(user_id):
     """Activate or deactivate a user account"""
     try:
@@ -743,9 +914,9 @@ def toggle_user_status(user_id):
         if not user:
             return jsonify({"error": "User not found"}), 404
 
-        # Admins cannot deactivate SuperAdmins
+        # Managers cannot deactivate SuperAdmins
         if request.role_id == 2 and user["role_id"] == 1:
-            return jsonify({"error": "Admins cannot modify SuperAdmin accounts"}), 403
+            return jsonify({"error": "Managers cannot modify SuperAdmin accounts"}), 403
 
         # Prevent self-deactivation
         if user_id == request.user_id:
@@ -806,7 +977,7 @@ def toggle_user_status(user_id):
 
 @app.route("/api/users/<int:user_id>", methods=["PUT"])
 @token_required
-@role_required(1, 2)  # SuperAdmin and Admin only
+@role_required(1, 2)  # SuperAdmin and Manager only
 def update_user(user_id):
     """Update user information"""
     try:
@@ -833,25 +1004,27 @@ def update_user(user_id):
             if existing:
                 return jsonify({"error": "Email already exists"}), 400
 
-        # Build update query dynamically
+        # Whitelist of allowed fields for users table
+        ALLOWED_USER_FIELDS = {
+            "full_name",
+            "email",
+            "role_id",
+        }
+
+        # Build update query dynamically with whitelist validation
         update_fields = []
         params = []
 
-        if full_name:
-            update_fields.append("full_name = %s")
-            params.append(full_name)
-
-        if email:
-            update_fields.append("email = %s")
-            params.append(email)
-
-        if role_id:
-            role_id = int(role_id)
-            update_fields.append("role_id = %s")
-            params.append(role_id)
+        for key, value in data.items():
+            if key in ALLOWED_USER_FIELDS:
+                if key == "role_id" and value:
+                    value = int(value)
+                    role_id = value  # Preserve for later use
+                update_fields.append(f"{key} = %s")
+                params.append(value)
 
         if not update_fields:
-            return jsonify({"error": "No fields to update"}), 400
+            return jsonify({"error": "No valid fields provided"}), 400
 
         params.append(user_id)
 
@@ -998,10 +1171,12 @@ def get_my_student_profile():
     try:
         student = db.execute_one(
             """SELECT s.*, u.full_name, u.email,
-                      c.full_name as counsellor_name
+                      c.full_name as counsellor_name,
+                      l.full_name as logistics_name
                FROM students s
                JOIN users u ON s.user_id = u.user_id
                LEFT JOIN users c ON s.assigned_counsellor_id = c.user_id
+               LEFT JOIN users l ON s.assigned_logistics_id = l.user_id
                WHERE s.user_id = %s""",
             (request.user_id,),
         )
@@ -1023,6 +1198,25 @@ def create_or_update_student_profile():
     """Create or update student profile"""
     try:
         data = request.json
+
+        # Validate and sanitize phone number if provided
+        if data.get("phone"):
+            is_valid, error_msg = validator.validate_phone(data.get("phone"))
+            if not is_valid:
+                return jsonify({"error": error_msg}), 400
+            # Clean phone number (keep only digits)
+            data["phone"] = re.sub(r'[\s\-\(\)\+]', '', data.get("phone"))
+
+        # Sanitize text fields to prevent XSS
+        text_fields = ["address", "program_interest", "preferred_country", "nationality", "notes"]
+        for field in text_fields:
+            if data.get(field):
+                # Check for malicious patterns
+                is_safe, pattern = validator.detect_malicious_patterns(data.get(field))
+                if not is_safe:
+                    return jsonify({"error": f"Suspicious input detected in {field}: {pattern}"}), 400
+                # Sanitize HTML
+                data[field] = validator.sanitize_text(data.get(field), max_length=1000 if field == "notes" else 255)
 
         # Check if profile exists
         existing = db.execute_one(
@@ -1137,9 +1331,9 @@ def get_my_logistics():
 
 @app.route("/api/students", methods=["GET"])
 @token_required
-@role_required(1, 2, 3)  # Manager, Admin, Counsellor
+@role_required(1, 2, 3)  # SuperAdmin, Manager, Counsellor
 def get_all_students():
-    """Get all students (for counsellors/admins)"""
+    """Get all students (for counsellors/managers)"""
     try:
         # If counsellor, only show assigned students
         if request.role_id == 3:
@@ -1172,7 +1366,7 @@ def get_all_students():
 
 @app.route("/api/students/<int:student_id>/assign", methods=["PUT"])
 @token_required
-@role_required(1, 2)  # Manager, Admin
+@role_required(1, 2)  # SuperAdmin, Manager
 def assign_counsellor(student_id):
     """Assign counsellor to student"""
     try:
@@ -1408,7 +1602,7 @@ def unassign_logistics(student_id):
 
 @app.route("/api/students/<int:student_id>/assign-counsellor", methods=["PUT"])
 @token_required
-@role_required(1, 2)  # Manager, Admin
+@role_required(1, 2)  # SuperAdmin, Manager
 def reassign_counsellor(student_id):
     """Assign or reassign counsellor to student"""
     try:
@@ -1527,7 +1721,7 @@ def reassign_counsellor(student_id):
 
 @app.route("/api/students/<int:student_id>/assign-logistics", methods=["PUT"])
 @token_required
-@role_required(1, 2)  # Manager, Admin
+@role_required(1, 2)  # SuperAdmin, Manager
 def reassign_logistics(student_id):
     """Assign or reassign logistics staff to student"""
     try:
@@ -1713,10 +1907,11 @@ def get_applications():
                    JOIN users usr ON s.user_id = usr.user_id
                    LEFT JOIN users c ON s.assigned_counsellor_id = c.user_id
                    WHERE a.university_id = %s
+                   AND (a.status = 'Forwarded to University' OR a.status LIKE 'Decision:%%')
                    ORDER BY a.created_at DESC""",
                 (university["university_id"],),
             )
-        else:  # Admin/Manager
+        else:  # Manager/SuperAdmin
             applications = db.execute_query(
                 """SELECT a.application_id, a.student_id, a.university_id, a.program_name,
                           a.intake, a.counsellor_id, a.status, a.decision_type, a.decision_notes, a.decision_date,
@@ -1751,17 +1946,25 @@ def create_application():
         # Get student_id
         if request.role_id == 6:  # Student
             student = db.execute_one(
-                "SELECT student_id, assigned_counsellor_id FROM students WHERE user_id = %s",
+                "SELECT student_id, assigned_counsellor_id, assigned_logistics_id FROM students WHERE user_id = %s",
                 (request.user_id,),
             )
+            # Create student record if it doesn't exist (profile not required for application)
             if not student:
-                return jsonify({"error": "Student profile not found"}), 404
+                student = db.execute_one(
+                    """INSERT INTO students (user_id, application_status)
+                       VALUES (%s, %s)
+                       RETURNING student_id, assigned_counsellor_id, assigned_logistics_id""",
+                    (request.user_id, "Incomplete Profile"),
+                )
 
             student_id = student["student_id"]
             counsellor_id = student["assigned_counsellor_id"]
+            logistics_id = student["assigned_logistics_id"]
         else:  # Counsellor
             student_id = data.get("student_id")
             counsellor_id = request.user_id
+            logistics_id = None
 
         # Handle both intake_id (new) and intake (legacy string format)
         intake_value = None
@@ -1780,6 +1983,154 @@ def create_application():
 
         if not intake_value:
             return jsonify({"error": "Intake is required"}), 400
+
+        # Auto-assign counsellor and logistics if student doesn't have them (first application submission)
+        counsellor = None
+        logistics = None
+        if request.role_id == 6 and (not counsellor_id or not logistics_id):
+            # Find counsellor with least students assigned
+            if not counsellor_id:
+                counsellor = db.execute_one(
+                    """SELECT u.user_id, u.full_name, COUNT(s.student_id) as student_count
+                       FROM users u
+                       LEFT JOIN students s ON u.user_id = s.assigned_counsellor_id
+                       WHERE u.role_id = 3 AND u.is_active = TRUE
+                       GROUP BY u.user_id, u.full_name
+                       ORDER BY student_count ASC, u.user_id ASC
+                       LIMIT 1"""
+                )
+                if counsellor:
+                    counsellor_id = counsellor["user_id"]
+            
+            # Find logistics staff with least students assigned
+            if not logistics_id:
+                logistics = db.execute_one(
+                    """SELECT u.user_id, u.full_name, COUNT(s.student_id) as student_count
+                       FROM users u
+                       LEFT JOIN students s ON u.user_id = s.assigned_logistics_id
+                       WHERE u.role_id = 5 AND u.is_active = TRUE
+                       GROUP BY u.user_id, u.full_name
+                       ORDER BY student_count ASC, u.user_id ASC
+                       LIMIT 1"""
+                )
+                if logistics:
+                    logistics_id = logistics["user_id"]
+            
+            # Update student with assignments
+            if counsellor_id or logistics_id:
+                # Determine application status based on assignments
+                if counsellor_id and logistics_id:
+                    application_status = "Assigned to Counsellor and Logistics"
+                elif counsellor_id:
+                    application_status = "Assigned to Counsellor"
+                else:
+                    application_status = "Incomplete Profile"
+                
+                db.execute_query(
+                    """UPDATE students 
+                       SET assigned_counsellor_id = COALESCE(%s, assigned_counsellor_id),
+                           assigned_logistics_id = COALESCE(%s, assigned_logistics_id),
+                           application_status = %s,
+                           updated_at = NOW()
+                       WHERE student_id = %s""",
+                    (counsellor_id, logistics_id, application_status, student_id),
+                    fetch=False,
+                )
+                
+                # Get student info for notifications
+                student_info = db.execute_one(
+                    """SELECT u.full_name as student_name
+                       FROM students s
+                       JOIN users u ON s.user_id = u.user_id
+                       WHERE s.student_id = %s""",
+                    (student_id,),
+                )
+                
+                # Log and notify counsellor assignment if newly assigned
+                if counsellor_id and not student.get("assigned_counsellor_id"):
+                    audit_details = f'Student ID: {student_id}, Student Name: {student_info["student_name"] if student_info else "N/A"}, Counsellor ID: {counsellor_id}, Counsellor Name: {counsellor["full_name"]}, Auto-assigned after application submission'
+                    db.execute_query(
+                        """INSERT INTO audit_logs (user_id, action, target_table, target_id, ip_address, details)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (
+                            request.user_id,
+                            "Auto-Assign Counsellor",
+                            "students",
+                            student_id,
+                            get_client_ip(request),
+                            audit_details,
+                        ),
+                        fetch=False,
+                    )
+                    
+                    # Create notification for student
+                    db.execute_query(
+                        """INSERT INTO notifications (user_id, title, message, triggered_by)
+                           VALUES (%s, %s, %s, %s)""",
+                        (
+                            request.user_id,
+                            "Counsellor Assigned",
+                            f"Counsellor {counsellor['full_name']} has been automatically assigned to your application.",
+                            request.user_id,
+                        ),
+                        fetch=False,
+                    )
+                    
+                    # Create notification for counsellor
+                    db.execute_query(
+                        """INSERT INTO notifications (user_id, title, message, triggered_by)
+                           VALUES (%s, %s, %s, %s)""",
+                        (
+                            counsellor_id,
+                            "New Student Assignment",
+                            f"Student {student_info['student_name'] if student_info else 'Unknown'} has been automatically assigned to you after they submitted an application.",
+                            request.user_id,
+                        ),
+                        fetch=False,
+                    )
+                
+                # Log and notify logistics assignment if newly assigned
+                if logistics_id and not student.get("assigned_logistics_id"):
+                    audit_details = f'Student ID: {student_id}, Student Name: {student_info["student_name"] if student_info else "N/A"}, Logistics ID: {logistics_id}, Logistics Name: {logistics["full_name"]}, Auto-assigned after application submission'
+                    db.execute_query(
+                        """INSERT INTO audit_logs (user_id, action, target_table, target_id, ip_address, details)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (
+                            request.user_id,
+                            "Auto-Assign Logistics",
+                            "students",
+                            student_id,
+                            get_client_ip(request),
+                            audit_details,
+                        ),
+                        fetch=False,
+                    )
+                    
+                    # Create notification for student
+                    db.execute_query(
+                        """INSERT INTO notifications (user_id, title, message, triggered_by)
+                           VALUES (%s, %s, %s, %s)""",
+                        (
+                            request.user_id,
+                            "Logistics Staff Assigned",
+                            f"Logistics staff {logistics['full_name']} has been automatically assigned to assist with your arrival.",
+                            request.user_id,
+                        ),
+                        fetch=False,
+                    )
+                    
+                    # Create notification for logistics staff
+                    db.execute_query(
+                        """INSERT INTO notifications (user_id, title, message, triggered_by)
+                           VALUES (%s, %s, %s, %s)""",
+                        (
+                            logistics_id,
+                            "New Student Assignment",
+                            f"Student {student_info['student_name'] if student_info else 'Unknown'} has been automatically assigned to you after they submitted an application.",
+                            request.user_id,
+                        ),
+                        fetch=False,
+                    )
 
         # Create application
         application = db.execute_one(
@@ -1836,7 +2187,7 @@ def create_application():
 
 @app.route("/api/applications/<int:application_id>/decision", methods=["PUT"])
 @token_required
-@role_required(1, 2, 4)  # SuperAdmin, Admin, and University Staff
+@role_required(1, 2, 4)  # SuperAdmin, Manager, and University Staff
 def make_decision(application_id):
     """University makes decision on application"""
     try:
@@ -1854,6 +2205,13 @@ def make_decision(application_id):
             decision_notes = data.get("decision_notes", "")
             offer_letter_file = None
             logger.info(f"JSON request - Decision: {decision_type}")
+        
+        # Validate and sanitize decision_notes if provided
+        if decision_notes:
+            is_safe, pattern = validator.detect_malicious_patterns(decision_notes)
+            if not is_safe:
+                return jsonify({"error": f"Suspicious input detected in decision notes: {pattern}"}), 400
+            decision_notes = validator.sanitize_text(decision_notes, max_length=2000)
 
         if decision_type not in [
             "Accepted",
@@ -1895,7 +2253,7 @@ def make_decision(application_id):
 
         # Check if application status is "Forwarded to University"
         # University Staff can only make decisions on forwarded applications
-        # SuperAdmin and Admin can make decisions on any status
+        # SuperAdmin and Manager can make decisions on any status
         if request.role_id == 4:  # University Staff
             if application["status"] != "Forwarded to University":
                 return (
@@ -2005,7 +2363,7 @@ def make_decision(application_id):
                         400,
                     )
 
-        # If decision is "Missing Documents", set status back to "In Review" so admin can re-forward
+        # If decision is "Missing Documents", set status back to "In Review" so manager can re-forward
         if decision_type == "Missing Documents":
             new_status = "Missing Documents - In Review"
         else:
@@ -2179,13 +2537,13 @@ def download_conditional_offer(application_id):
         if not application["conditional_offer_encrypted_blob"]:
             return jsonify({"error": "No offer letter found for this application"}), 404
 
-        # Access control: Student (owner), counsellor (assigned), university staff (their university), and admins can download
+        # Access control: Student (owner), counsellor (assigned), university staff (their university), and managers can download
         user_role_id = request.role_id
         user_id = request.user_id
 
         has_access = False
 
-        # SuperAdmin or Admin
+        # SuperAdmin or Manager
         if user_role_id in [1, 2]:
             has_access = True
 
@@ -2222,10 +2580,17 @@ def download_conditional_offer(application_id):
             )
 
         # Decrypt the file
-        decrypted_content = encryption_service.decrypt_document(
-            application["conditional_offer_encrypted_blob"],
-            application["conditional_offer_iv"],
-        )
+        # Handle both string and bytes from database
+        encrypted_blob = application["conditional_offer_encrypted_blob"]
+        iv = application["conditional_offer_iv"]
+        
+        # If data is bytes, decode to string (base64)
+        if isinstance(encrypted_blob, bytes):
+            encrypted_blob = encrypted_blob.decode("utf-8")
+        if isinstance(iv, bytes):
+            iv = iv.decode("utf-8")
+        
+        decrypted_content = encryption_service.decrypt_document(encrypted_blob, iv)
 
         # Log the download
         db.execute_query(
@@ -2258,13 +2623,20 @@ def download_conditional_offer(application_id):
 
 @app.route("/api/applications/<int:application_id>/status", methods=["PUT"])
 @token_required
-@role_required(1, 2, 3)  # Admin, SuperAdmin, Counsellor
+@role_required(1, 2, 3)  # SuperAdmin, Manager, Counsellor
 def update_application_status(application_id):
-    """Update application status by counsellor/admin"""
+    """Update application status by counsellor/manager"""
     try:
         data = request.json
         status = data.get("status")
         notes = data.get("notes", "")
+        
+        # Validate and sanitize notes if provided
+        if notes:
+            is_safe, pattern = validator.detect_malicious_patterns(notes)
+            if not is_safe:
+                return jsonify({"error": f"Suspicious input detected in notes: {pattern}"}), 400
+            notes = validator.sanitize_text(notes, max_length=2000)
 
         if not status:
             return jsonify({"error": "Status is required"}), 400
@@ -2325,7 +2697,7 @@ def update_application_status(application_id):
 
 @app.route("/api/applications/<int:application_id>/forward", methods=["PUT"])
 @token_required
-@role_required(1, 2, 3)  # SuperAdmin, Admin, and Counsellor can forward
+@role_required(1, 2, 3)  # SuperAdmin, Manager, and Counsellor can forward
 def forward_application(application_id):
     """Forward application to university staff for review"""
     try:
@@ -2338,9 +2710,9 @@ def forward_application(application_id):
             (request.user_id,),
         )
 
-        # Get application details - SuperAdmin and Admin can forward any application
+        # Get application details - SuperAdmin and Manager can forward any application
         # Counsellors can only forward their own applications OR applications from students assigned to them
-        if request.role_id in [1, 2]:  # SuperAdmin or Admin
+        if request.role_id in [1, 2]:  # SuperAdmin or Manager
             app = db.execute_one(
                 """SELECT a.*, s.user_id as student_user_id, u.full_name as student_name, 
                           uni.name as university_name, uni.portal_user_id,
@@ -2517,9 +2889,9 @@ def forward_application(application_id):
 
 @app.route("/api/applications/<int:application_id>/delete", methods=["DELETE"])
 @token_required
-@role_required(1, 2, 6)  # SuperAdmin, Admin, and Student
+@role_required(1, 2, 6)  # SuperAdmin, Manager, and Student
 def delete_application(application_id):
-    """Delete application (Admin and SuperAdmin can delete any, Students can delete their own if In Review)"""
+    """Delete application (Manager and SuperAdmin can delete any, Students can delete their own if In Review)"""
     try:
         # Get application details for audit trail
         application = db.execute_one(
@@ -2638,7 +3010,7 @@ def get_documents():
 
             documents = db.execute_query(
                 """SELECT document_id, doc_type, uploaded_at, verified, uni_verified, 
-                          verification_notes, uni_verification_notes, application_id
+                          verification_notes, uni_verification_notes, application_id, filename
                    FROM documents
                    WHERE student_id = %s
                    ORDER BY uploaded_at DESC""",
@@ -2647,7 +3019,7 @@ def get_documents():
         elif request.role_id == 3:  # Counsellor
             documents = db.execute_query(
                 """SELECT d.document_id, d.doc_type, d.uploaded_at, d.verified, d.uni_verified,
-                          d.verification_notes, d.uni_verification_notes, d.application_id,
+                          d.verification_notes, d.uni_verification_notes, d.application_id, d.filename,
                           s.student_id, u.full_name as student_name
                    FROM documents d
                    JOIN students s ON d.student_id = s.student_id
@@ -2677,7 +3049,7 @@ def get_documents():
             # (Forwarded to University, Decision: Accepted, Decision: Conditional, Decision: Rejected)
             documents = db.execute_query(
                 """SELECT d.document_id, d.doc_type, d.uploaded_at, d.verified, d.uni_verified,
-                          d.verification_notes, d.uni_verification_notes, d.application_id,
+                          d.verification_notes, d.uni_verification_notes, d.application_id, d.filename,
                           s.student_id, u.full_name as student_name, a.status as application_status
                    FROM documents d
                    JOIN students s ON d.student_id = s.student_id
@@ -2689,10 +3061,10 @@ def get_documents():
                 (uni_id,),
             )
             print(f"Found {len(documents) if documents else 0} documents")
-        else:  # Admin/Manager
+        else:  # Manager/SuperAdmin
             documents = db.execute_query(
                 """SELECT d.document_id, d.doc_type, d.uploaded_at, d.verified, d.uni_verified,
-                          d.verification_notes, d.uni_verification_notes, d.application_id,
+                          d.verification_notes, d.uni_verification_notes, d.application_id, d.filename,
                           s.student_id, u.full_name as student_name
                    FROM documents d
                    JOIN students s ON d.student_id = s.student_id
@@ -2758,7 +3130,7 @@ def download_document(document_id):
                    AND (a.status = 'Forwarded to University' OR a.status LIKE 'Decision:%%')""",
                 (document_id, university["university_id"]),
             )
-        else:  # Admin/SuperAdmin - can download all documents
+        else:  # Manager/SuperAdmin - can download all documents
             document = db.execute_one(
                 """SELECT d.*, s.user_id as student_user_id
                    FROM documents d
@@ -2780,9 +3152,21 @@ def download_document(document_id):
         )
 
         # Decrypt document
-        decrypted_data = encryption_service.decrypt_document(
-            document["encrypted_blob"], document["iv"]
-        )
+        # Handle both string and bytes from database
+        encrypted_blob = document["encrypted_blob"]
+        iv = document["iv"]
+        
+        # If data is bytes, decode to string (base64)
+        if isinstance(encrypted_blob, bytes):
+            encrypted_blob = encrypted_blob.decode("utf-8")
+        if isinstance(iv, bytes):
+            iv = iv.decode("utf-8")
+        
+        try:
+            decrypted_data = encryption_service.decrypt_document(encrypted_blob, iv)
+        except Exception as decrypt_error:
+            logger.error(f"Decryption error for document {document_id}: {decrypt_error}")
+            return jsonify({"error": "Failed to decrypt document. The file may be corrupted."}), 500
 
         # Log download action with details
         audit_details = f'Document ID: {document_id}, Document Type: {document["doc_type"]}, Student Name: {student_info["student_name"] if student_info else "N/A"}'
@@ -2804,50 +3188,92 @@ def download_document(document_id):
         from flask import send_file
         from io import BytesIO
 
-        return send_file(
+        # Use original filename if available, otherwise fallback to generic name
+        filename = document.get("filename") or f"{document['doc_type']}_{document_id}.pdf"
+        # Ensure filename ends with .pdf
+        if not filename.lower().endswith('.pdf'):
+            filename += '.pdf'
+        
+        # Log the filename being used for download
+        logger.info(f"Downloading document {document_id} with filename: {filename}")
+        
+        # Ensure decrypted_data is bytes
+        if not isinstance(decrypted_data, bytes):
+            logger.error(f"Decrypted data is not bytes, type: {type(decrypted_data)}")
+            return jsonify({"error": "Invalid file data"}), 500
+        
+        # Create response with proper headers
+        response = send_file(
             BytesIO(decrypted_data),
-            download_name=f"{document['doc_type']}_{document_id}.pdf",
+            download_name=filename,
             as_attachment=True,
             mimetype="application/pdf",
         )
+        
+        # Ensure proper headers for download
+        response.headers['Content-Type'] = 'application/pdf'
+        # Use filename* for better browser compatibility
+        import urllib.parse
+        encoded_filename = urllib.parse.quote(filename)
+        response.headers['Content-Disposition'] = f'attachment; filename="{filename}"; filename*=UTF-8\'\'{encoded_filename}'
+        response.headers['Content-Length'] = str(len(decrypted_data))
+        
+        logger.info(f"Returning file download response: {len(decrypted_data)} bytes, filename: {filename}")
+        return response
 
     except Exception as e:
+        import traceback
         logger.error(f"Download document error: {e}")
-        return jsonify({"error": "Failed to download document"}), 500
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return jsonify({"error": f"Failed to download document: {str(e)}"}), 500
 
 
 @app.route("/api/documents/upload", methods=["POST"])
 @token_required
 @role_required(6)  # Student only
 def upload_document():
-    """Upload encrypted documents (multiple files)"""
+    """Upload encrypted document"""
     try:
         # Get student_id
         student = db.execute_one(
-            "SELECT student_id FROM students WHERE user_id = %s",
-            (request.user_id,)
+            "SELECT student_id FROM students WHERE user_id = %s", (request.user_id,)
         )
         if not student:
             return jsonify({"error": "Student profile not found"}), 404
 
-        # Get files from request (MULTIPLE)
-        files = request.files.getlist("files")
+        # Get files from request (support multiple files)
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
 
-        if not files or len(files) == 0:
-            return jsonify({"error": "No files provided"}), 400
-
-        doc_type = request.form.get("doc_type")
+        files = request.files.getlist("file")  # Get all files
         application_id = request.form.get("application_id")
-
-        if not doc_type:
-            return jsonify({"error": "Document type required"}), 400
+        
+        # Helper function to detect document type from filename
+        def detect_document_type(filename):
+            """Auto-detect document type from filename"""
+            if not filename:
+                return "Unclassified"
+            filename_lower = filename.lower()
+            if "passport" in filename_lower:
+                return "Passport"
+            elif "transcript" in filename_lower or "academic" in filename_lower:
+                return "Transcript"
+            elif "english" in filename_lower or "ielts" in filename_lower or "toefl" in filename_lower or "test" in filename_lower:
+                return "English Test"
+            elif "photo" in filename_lower or "picture" in filename_lower or "image" in filename_lower:
+                return "Personal Photo"
+            else:
+                return "Unclassified"
 
         if not application_id:
             return jsonify({"error": "Application ID required"}), 400
 
+        if not files or len(files) == 0:
+            return jsonify({"error": "No files provided"}), 400
+
         # Verify application belongs to student
         application = db.execute_one(
-            """SELECT application_id FROM applications
+            """SELECT application_id FROM applications 
                WHERE application_id = %s AND student_id = %s""",
             (application_id, student["student_id"]),
         )
@@ -2855,49 +3281,107 @@ def upload_document():
         if not application:
             return jsonify({"error": "Application not found or access denied"}), 404
 
-        # Loop through files
+        # Validate all files are PDF
         for file in files:
-            file_content = file.read()
+            if not file.filename:
+                continue
+            if not file.filename.lower().endswith(".pdf"):
+                return jsonify({"error": "All files must be PDF format"}), 400
 
+        # Ensure filename column exists
+        try:
+            db.execute_query(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS filename VARCHAR(255)",
+                fetch=False,
+            )
+        except Exception:
+            pass  # Column may already exist
+
+        # Process and store all files
+        uploaded_documents = []
+        for idx, file in enumerate(files):
+            # Debug: Log file object details
+            logger.info(f"Processing file {idx}: type={type(file)}, hasattr filename={hasattr(file, 'filename')}")
+            if hasattr(file, 'filename'):
+                logger.info(f"File {idx} filename attribute: '{file.filename}'")
+            
+            # Get original filename - try multiple methods
+            original_filename = None
+            
+            # Method 1: Try file.filename (standard Flask) - this should work
+            if hasattr(file, 'filename') and file.filename:
+                original_filename = file.filename
+                logger.info(f"File {idx}: Got filename from file.filename: '{original_filename}'")
+            # Method 2: Try name attribute
+            elif hasattr(file, 'name') and file.name:
+                original_filename = file.name
+                logger.info(f"File {idx}: Got filename from file.name: '{original_filename}'")
+            # Method 3: Try content_disposition header
+            elif hasattr(file, 'headers'):
+                import re
+                cd = file.headers.get('Content-Disposition', '')
+                logger.info(f"File {idx}: Content-Disposition header: '{cd}'")
+                match = re.search(r'filename[^;=\n]*=(([\'"]).*?\2|[^;\n]*)', cd)
+                if match:
+                    original_filename = match.group(1).strip('\'"')
+                    logger.info(f"File {idx}: Got filename from Content-Disposition: '{original_filename}'")
+            
+            # If still no filename, use a default but don't skip the file
+            if not original_filename:
+                logger.warning(f"File {idx} without filename detected, using default name")
+                original_filename = f"document_{idx + 1}.pdf"
+            else:
+                logger.info(f"File {idx} original filename: '{original_filename}'")
+            
+            # Remove path components and keep only the filename
+            import os
+            original_filename = os.path.basename(original_filename)
+            
+            # Log the sanitized filename
+            logger.info(f"File {idx} sanitized filename: '{original_filename}'")
+            
+            # Ensure it ends with .pdf
+            if not original_filename.lower().endswith('.pdf'):
+                original_filename += '.pdf'
+            
+            # Auto-detect document type from filename
+            detected_doc_type = detect_document_type(original_filename)
+            logger.info(f"File {idx} detected document type: '{detected_doc_type}' from filename '{original_filename}'")
+            
+            # Read file content (ensure binary mode)
+            file.seek(0)  # Reset file pointer
+            file_content = file.read()
+            
+            if not file_content:
+                continue  # Skip empty files
+
+            # Encrypt document
             encrypted_data, iv = encryption_service.encrypt_document(file_content)
 
-            db.execute_one(
-                """INSERT INTO documents
-                   (student_id, uploaded_by, doc_type, encrypted_blob, iv, key_version, application_id, verified)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, NULL)""",
+            # Store in database with application_id and original filename
+            logger.info(f"Storing file {idx} with filename: '{original_filename}' and type: '{detected_doc_type}'")
+            document = db.execute_one(
+                """INSERT INTO documents (student_id, uploaded_by, doc_type, encrypted_blob, iv, key_version, application_id, verified, filename)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s)
+                   RETURNING document_id, uploaded_at, filename""",
                 (
                     student["student_id"],
                     request.user_id,
-                    doc_type,
+                    detected_doc_type,
                     encrypted_data,
                     iv,
                     "v1",
                     application_id,
+                    original_filename,
                 ),
             )
-
-        return jsonify({"message": "Documents uploaded successfully"}), 201
-
-    except Exception as e:
-        logger.error(f"Upload document error: {e}")
-        return jsonify({"error": "Failed to upload documents"}), 500
-
-
-        # Store in database with application_id
-        document = db.execute_one(
-            """INSERT INTO documents (student_id, uploaded_by, doc_type, encrypted_blob, iv, key_version, application_id, verified)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, NULL)
-               RETURNING document_id, uploaded_at""",
-            (
-                student["student_id"],
-                request.user_id,
-                doc_type,
-                encrypted_data,
-                iv,
-                "v1",
-                application_id,
-            ),
-        )
+            # Verify filename was stored
+            if document:
+                stored_filename = document.get('filename', 'NOT IN RESULT')
+                logger.info(f"Document {document['document_id']} stored. Filename in result: '{stored_filename}'")
+                # Store document type with the document for later use
+                document['doc_type'] = detected_doc_type
+            uploaded_documents.append(document)
 
         # Get student name for audit
         student_info = db.execute_one(
@@ -2908,36 +3392,44 @@ def upload_document():
             (student["student_id"],),
         )
 
-        # Log action with details
-        audit_details = f'Document ID: {document["document_id"]}, Document Type: {doc_type}, Application ID: {application_id}, Student Name: {student_info["student_name"] if student_info else "N/A"}'
-        db.execute_query(
-            """INSERT INTO audit_logs (user_id, action, target_table, target_id, ip_address, details)
-               VALUES (%s, %s, %s, %s, %s, %s)""",
-            (
-                request.user_id,
-                "Upload Document",
-                "documents",
-                document["document_id"],
-                get_client_ip(request),
-                audit_details,
-            ),
-            fetch=False,
-        )
+        # Log action with details for all uploaded documents
+        for document in uploaded_documents:
+            # Use the doc_type we stored with the document
+            doc_type_display = document.get('doc_type', 'Unknown')
+            
+            audit_details = f'Document ID: {document["document_id"]}, Document Type: {doc_type_display}, Application ID: {application_id}, Student Name: {student_info["student_name"] if student_info else "N/A"}'
+            db.execute_query(
+                """INSERT INTO audit_logs (user_id, action, target_table, target_id, ip_address, details)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (
+                    request.user_id,
+                    "Upload Document",
+                    "documents",
+                    document["document_id"],
+                    get_client_ip(request),
+                    audit_details,
+                ),
+                fetch=False,
+            )
 
-        # Notify counsellor if assigned
-        if student:
-            student_info = db.execute_one(
+        # Notify counsellor if assigned (only once for multiple files)
+        if uploaded_documents:
+            student_assignment = db.execute_one(
                 "SELECT assigned_counsellor_id FROM students WHERE student_id = %s",
                 (student["student_id"],),
             )
-            if student_info and student_info["assigned_counsellor_id"]:
+            if student_assignment and student_assignment["assigned_counsellor_id"]:
+                # Get document types from the uploaded documents (already stored in document dict)
+                doc_types = [doc.get('doc_type', 'Unknown') for doc in uploaded_documents if doc.get('doc_type')]
+                doc_types_str = ", ".join(set(doc_types)) if doc_types else "document(s)"
+                
                 db.execute_query(
                     """INSERT INTO notifications (user_id, title, message, triggered_by)
                        VALUES (%s, %s, %s, %s)""",
                     (
-                        student_info["assigned_counsellor_id"],
+                        student_assignment["assigned_counsellor_id"],
                         "New Document Uploaded",
-                        f"A student has uploaded a new document: {doc_type}",
+                        f"Student has uploaded {len(uploaded_documents)} new document(s): {doc_types_str}",
                         request.user_id,
                     ),
                     fetch=False,
@@ -2946,8 +3438,9 @@ def upload_document():
         return (
             jsonify(
                 {
-                    "message": "Document uploaded successfully",
-                    "document_id": document["document_id"],
+                    "message": f"{len(uploaded_documents)} document(s) uploaded successfully",
+                    "document_ids": [doc["document_id"] for doc in uploaded_documents],
+                    "count": len(uploaded_documents),
                 }
             ),
             201,
@@ -2960,14 +3453,22 @@ def upload_document():
 
 @app.route("/api/documents/<int:document_id>/verify", methods=["PUT"])
 @token_required
-@role_required(1, 2, 3, 4)  # SuperAdmin, Admin, Counsellor, University Staff
+@role_required(1, 2, 3, 4)  # SuperAdmin, Manager, Counsellor, University Staff
 def verify_document(document_id):
+    """Verify document with notes - includes input validation"""
     """Verify document"""
     try:
         data = request.json or {}
         # support action: approve / reject and optional notes
         action = data.get("action", "approve")
         notes = data.get("notes")
+        
+        # Validate and sanitize notes if provided
+        if notes:
+            is_safe, pattern = validator.detect_malicious_patterns(notes)
+            if not is_safe:
+                return jsonify({"error": f"Suspicious input detected in notes: {pattern}"}), 400
+            notes = validator.sanitize_text(notes, max_length=1000)
 
         # Get document info first
         document = db.execute_one(
@@ -3092,10 +3593,10 @@ def verify_document(document_id):
             pass
 
         # Two-stage verification:
-        # Stage 1: Counsellor/Admin/SuperAdmin verifies (verified column)
+        # Stage 1: Counsellor/Manager/SuperAdmin verifies (verified column)
         # Stage 2: University Staff verifies (uni_verified column)
 
-        if request.role_id in [1, 2, 3]:  # SuperAdmin, Admin, Counsellor - Stage 1
+        if request.role_id in [1, 2, 3]:  # SuperAdmin, Manager, Counsellor - Stage 1
             verified = True if action == "approve" else False
             db.execute_query(
                 """UPDATE documents SET verified = %s, verification_notes = %s, 
@@ -3171,9 +3672,9 @@ def verify_document(document_id):
 
 @app.route("/api/documents/<int:document_id>/delete", methods=["DELETE"])
 @token_required
-@role_required(1, 2, 3, 6)  # SuperAdmin, Admin, Counsellor, Student
+@role_required(1, 2, 3, 6)  # SuperAdmin, Manager, Counsellor, Student
 def delete_document(document_id):
-    """Delete document (Student, Admin, SuperAdmin, Counsellor can delete documents)"""
+    """Delete document (Student, Manager, SuperAdmin, Counsellor can delete documents)"""
     try:
         # Get document info and verify ownership/access
         document = db.execute_one(
@@ -3212,7 +3713,7 @@ def delete_document(document_id):
                     ),
                     403,
                 )
-        # SuperAdmin (1) and Admin (2) can delete any document - no additional check needed
+        # SuperAdmin (1) and Manager (2) can delete any document - no additional check needed
 
         # Log action BEFORE deletion for audit trail
         audit_details = f'DELETED Document - ID: {document_id}, Type: {document["doc_type"]}, Student Name: {document["student_name"]}'
@@ -3265,9 +3766,9 @@ def get_universities():
 
 @app.route("/api/universities", methods=["POST"])
 @token_required
-@role_required(1, 2)  # SuperAdmin and Admin only
+@role_required(1, 2)  # SuperAdmin and Manager only
 def create_university():
-    """Create new university (Admin only)"""
+    """Create new university (Manager only)"""
     try:
         data = request.json
         name = data.get("name")
@@ -3325,7 +3826,7 @@ def create_university():
 
 @app.route("/api/universities/<int:university_id>", methods=["PUT"])
 @token_required
-@role_required(1, 2)  # SuperAdmin and Admin only
+@role_required(1, 2)  # SuperAdmin and Manager only
 def update_university(university_id):
     """Update university information"""
     try:
@@ -3355,24 +3856,30 @@ def update_university(university_id):
                     400,
                 )
 
-        # Build update query dynamically
+        # Whitelist of allowed fields for universities table
+        ALLOWED_UNIVERSITY_FIELDS = {
+            "name",
+            "country",
+            "contact_email",
+        }
+
+        # Build update query dynamically with whitelist validation
         update_fields = []
         params = []
 
-        if name:
-            update_fields.append("name = %s")
-            params.append(name)
-
-        if country is not None:  # Allow empty string to clear field
-            update_fields.append("country = %s")
-            params.append(country if country else None)
-
-        if contact_email is not None:  # Allow empty string to clear field
-            update_fields.append("contact_email = %s")
-            params.append(contact_email if contact_email else None)
+        for key, value in data.items():
+            if key in ALLOWED_UNIVERSITY_FIELDS:
+                if key == "name" and value:
+                    # Only update name if it's truthy
+                    update_fields.append(f"{key} = %s")
+                    params.append(value)
+                elif key in ["country", "contact_email"] and value is not None:
+                    # Allow empty string to clear field
+                    update_fields.append(f"{key} = %s")
+                    params.append(value if value else None)
 
         if not update_fields:
-            return jsonify({"error": "No fields to update"}), 400
+            return jsonify({"error": "No valid fields provided"}), 400
 
         params.append(university_id)
 
@@ -3408,7 +3915,7 @@ def update_university(university_id):
 
 @app.route("/api/universities/<int:university_id>/delete", methods=["DELETE"])
 @token_required
-@role_required(1, 2)  # SuperAdmin and Admin only
+@role_required(1, 2)  # SuperAdmin and Manager only
 def delete_university(university_id):
     """Delete university and deactivate all associated university staff accounts"""
     try:
@@ -3519,7 +4026,7 @@ def get_university_intakes(university_id):
 
 @app.route("/api/universities/<int:university_id>/intakes", methods=["POST"])
 @token_required
-@role_required(1, 2, 4)  # SuperAdmin, Admin, University Staff
+@role_required(1, 2, 4)  # SuperAdmin, Manager, University Staff
 def create_intake(university_id):
     """Create new intake for a university"""
     try:
@@ -3607,7 +4114,7 @@ def create_intake(university_id):
 
 @app.route("/api/intakes/<int:intake_id>", methods=["PUT", "DELETE"])
 @token_required
-@role_required(1, 2, 4)  # SuperAdmin, Admin, University Staff
+@role_required(1, 2, 4)  # SuperAdmin, Manager, University Staff
 def manage_intake(intake_id):
     """Update or delete an intake"""
     try:
@@ -3643,32 +4150,26 @@ def manage_intake(intake_id):
         if request.method == "PUT":
             data = request.json
 
-            # Build update query dynamically
+            # Whitelist of allowed fields for intakes table
+            ALLOWED_INTAKE_FIELDS = {
+                "intake_name",
+                "intake_year",
+                "start_date",
+                "end_date",
+                "is_active",
+            }
+
+            # Build update query dynamically with whitelist validation
             update_fields = []
             params = []
 
-            if "intake_name" in data:
-                update_fields.append("intake_name = %s")
-                params.append(data["intake_name"])
-
-            if "intake_year" in data:
-                update_fields.append("intake_year = %s")
-                params.append(data["intake_year"])
-
-            if "start_date" in data:
-                update_fields.append("start_date = %s")
-                params.append(data["start_date"])
-
-            if "end_date" in data:
-                update_fields.append("end_date = %s")
-                params.append(data["end_date"])
-
-            if "is_active" in data:
-                update_fields.append("is_active = %s")
-                params.append(data["is_active"])
+            for key, value in data.items():
+                if key in ALLOWED_INTAKE_FIELDS:
+                    update_fields.append(f"{key} = %s")
+                    params.append(value)
 
             if not update_fields:
-                return jsonify({"error": "No fields to update"}), 400
+                return jsonify({"error": "No valid fields provided"}), 400
 
             update_fields.append("updated_at = NOW()")
             params.append(intake_id)
@@ -3752,9 +4253,9 @@ def manage_intake(intake_id):
 
 @app.route("/api/students/<int:student_id>", methods=["GET"])
 @token_required
-@role_required(1, 2, 3)  # SuperAdmin, Admin, Counsellor
+@role_required(1, 2, 3)  # SuperAdmin, Manager, Counsellor
 def get_student_detail(student_id):
-    """Get student profile, documents and applications for counsellor/admin view"""
+    """Get student profile, documents and applications for counsellor/manager view"""
     try:
         logger.info(
             f"Fetching student detail for student_id: {student_id}, user_id: {request.user_id}, role_id: {request.role_id}"
@@ -4088,7 +4589,7 @@ def get_chat_users():
         role_id = user["role_id"]
 
         # Define chat permissions based on roles
-        # 1=SuperAdmin, 2=Admin, 3=Counsellor, 4=University, 5=Logistics, 6=Student
+        # 1=SuperAdmin, 2=Manager, 3=Counsellor, 4=University, 5=Logistics, 6=Student
         if role_id == 1:  # SuperAdmin can chat with everyone
             users = db.execute_query(
                 """SELECT u.user_id, u.full_name, u.email, r.role_name
@@ -4100,7 +4601,7 @@ def get_chat_users():
             )
         elif (
             role_id == 2
-        ):  # Admin can chat with ALL users (SuperAdmin, Admins, Counsellors, University Staff, Logistics Staff, Students)
+        ):  # Manager can chat with ALL users (SuperAdmin, Managers, Counsellors, University Staff, Logistics Staff, Students)
             users = db.execute_query(
                 """SELECT u.user_id, u.full_name, u.email, r.role_name
                    FROM users u
@@ -4112,7 +4613,7 @@ def get_chat_users():
             )
         elif (
             role_id == 3
-        ):  # Counsellor can chat with Admins, other Counsellors, University Staff, ALL Logistics Staff, their Students (NO SuperAdmin)
+        ):  # Counsellor can chat with Managers, other Counsellors, University Staff, ALL Logistics Staff, their Students (NO SuperAdmin)
             users = db.execute_query(
                 """SELECT u.user_id, u.full_name, u.email, r.role_name
                    FROM users u
@@ -4127,7 +4628,7 @@ def get_chat_users():
                    ORDER BY r.role_id, u.full_name""",
                 (request.user_id, request.user_id),
             )
-        elif role_id == 4:  # University Staff can chat with Admins and Counsellors only
+        elif role_id == 4:  # University Staff can chat with Managers and Counsellors only
             users = db.execute_query(
                 """SELECT u.user_id, u.full_name, u.email, r.role_name
                    FROM users u
@@ -4140,7 +4641,7 @@ def get_chat_users():
             )
         elif (
             role_id == 5
-        ):  # Logistics Staff can chat with Admins, Counsellors, other Logistics Staff, and their assigned Students
+        ):  # Logistics Staff can chat with Managers, Counsellors, other Logistics Staff, and their assigned Students
             users = db.execute_query(
                 """SELECT DISTINCT ON (u.user_id) u.user_id, u.full_name, u.email, r.role_name, r.role_id as role_sort
                    FROM users u
@@ -4160,7 +4661,7 @@ def get_chat_users():
             )
         elif (
             role_id == 6
-        ):  # Student can ONLY chat with: assigned counsellor, assigned logistics staff, and all admins
+        ):  # Student can ONLY chat with: assigned counsellor, assigned logistics staff, and all managers
             users = db.execute_query(
                 """SELECT DISTINCT ON (u.user_id) u.user_id, u.full_name, u.email, r.role_name, r.role_id as role_sort
                    FROM users u
@@ -4181,7 +4682,7 @@ def get_chat_users():
                            WHERE s.user_id = %s AND s.assigned_logistics_id IS NOT NULL
                        )
                        OR
-                       -- All Admins (role_id = 2)
+                       -- All Managers (role_id = 2)
                        u.role_id = 2
                    )
                    ORDER BY u.user_id, r.role_id, u.full_name""",
@@ -4365,7 +4866,7 @@ def mark_all_notifications_read():
 
 @app.route("/api/notifications", methods=["POST"])
 @token_required
-@role_required(1, 2, 3)  # Admin, SuperAdmin, Counsellor can send notifications
+@role_required(1, 2, 3)  # SuperAdmin, Manager, Counsellor can send notifications
 def create_notification():
     try:
         data = request.json
@@ -4409,7 +4910,7 @@ def create_notification():
 
 @app.route("/api/logistics", methods=["GET"])
 @token_required
-@role_required(1, 2, 3, 5)  # Admin, Counsellor, or Logistics Staff
+@role_required(1, 2, 3, 5)  # Manager, Counsellor, or Logistics Staff
 def get_logistics():
     """Get logistics records"""
     try:
@@ -4434,7 +4935,7 @@ def get_logistics():
                    ORDER BY l.pickup_date DESC""",
                 (request.user_id,),
             )
-        else:  # Admin and SuperAdmin can see all logistics records
+        else:  # Manager and SuperAdmin can see all logistics records
             logistics = db.execute_query(
                 """SELECT l.*, s.student_id, u.full_name as student_name, s.phone
                    FROM logistics l
@@ -4474,7 +4975,7 @@ def get_logistics():
 
 @app.route("/api/logistics", methods=["POST"])
 @token_required
-@role_required(1, 2, 5)  # Admin or Logistics Staff
+@role_required(1, 2, 5)  # Manager or Logistics Staff
 def create_logistics():
     """Create logistics record"""
     try:
@@ -4534,7 +5035,7 @@ def create_logistics():
 
 @app.route("/api/logistics/<int:logistics_id>", methods=["PUT"])
 @token_required
-@role_required(1, 2, 5, 6)  # Admin, Logistics Staff, or Student
+@role_required(1, 2, 5, 6)  # Manager, Logistics Staff, or Student
 def update_logistics(logistics_id):
     """Update logistics record"""
     try:
@@ -4600,7 +5101,19 @@ def update_logistics(logistics_id):
                     403,
                 )
 
-        # Build update query dynamically
+        # Whitelist of allowed fields for logistics table
+        ALLOWED_LOGISTICS_FIELDS = {
+            "arrival_status",
+            "pickup_date",
+            "pickup_time",
+            "pickup_location",
+            "accommodation",
+            "medical_check_date",
+            "arrival_date",
+            "flight_details",
+        }
+
+        # Build update query dynamically with whitelist validation
         update_fields = []
         params = []
 
@@ -4613,57 +5126,40 @@ def update_logistics(logistics_id):
             "Completed",
         ]
 
-        if "arrival_status" in data:
-            if data["arrival_status"] not in valid_statuses:
-                return (
-                    jsonify(
-                        {
-                            "error": "Invalid status. Valid statuses: Pending, Arrived, Accommodation, Medical Check Process, Completed"
-                        }
-                    ),
-                    400,
-                )
-            update_fields.append("arrival_status = %s")
-            params.append(data["arrival_status"])
+        # Fields that can only be updated by Manager/SuperAdmin/Student
+        manager_only_fields = {
+            "pickup_date",
+            "pickup_time",
+            "pickup_location",
+            "accommodation",
+            "medical_check_date",
+            "arrival_date",
+            "flight_details",
+        }
 
-        # Admin/SuperAdmin can update all fields
-        if request.role_id in [1, 2, 6]:  # Admin, SuperAdmin, or Student
-            if "pickup_date" in data:
-                update_fields.append("pickup_date = %s")
-                params.append(data["pickup_date"] if data["pickup_date"] else None)
-
-            if "pickup_time" in data:
-                update_fields.append("pickup_time = %s")
-                params.append(data["pickup_time"] if data["pickup_time"] else None)
-
-            if "pickup_location" in data:
-                update_fields.append("pickup_location = %s")
-                params.append(
-                    data["pickup_location"] if data["pickup_location"] else None
-                )
-
-            if "accommodation" in data:
-                update_fields.append("accommodation = %s")
-                params.append(data["accommodation"] if data["accommodation"] else None)
-
-            if "medical_check_date" in data:
-                update_fields.append("medical_check_date = %s")
-                params.append(
-                    data["medical_check_date"] if data["medical_check_date"] else None
-                )
-
-            if "arrival_date" in data:
-                update_fields.append("arrival_date = %s")
-                params.append(data["arrival_date"] if data["arrival_date"] else None)
-
-            if "flight_details" in data:
-                update_fields.append("flight_details = %s")
-                params.append(
-                    data["flight_details"] if data["flight_details"] else None
-                )
+        for key, value in data.items():
+            if key in ALLOWED_LOGISTICS_FIELDS:
+                if key == "arrival_status":
+                    # Validate status
+                    if value not in valid_statuses:
+                        return (
+                            jsonify(
+                                {
+                                    "error": "Invalid status. Valid statuses: Pending, Arrived, Accommodation, Medical Check Process, Completed"
+                                }
+                            ),
+                            400,
+                        )
+                    update_fields.append(f"{key} = %s")
+                    params.append(value)
+                elif key in manager_only_fields:
+                    # Only Manager/SuperAdmin/Student can update these fields
+                    if request.role_id in [1, 2, 6]:  # Manager, SuperAdmin, or Student
+                        update_fields.append(f"{key} = %s")
+                        params.append(value if value else None)
 
         if not update_fields:
-            return jsonify({"error": "No fields to update"}), 400
+            return jsonify({"error": "No valid fields provided"}), 400
 
         update_fields.append("updated_by = %s")
         params.append(request.user_id)
@@ -4720,9 +5216,9 @@ def update_logistics(logistics_id):
 
 @app.route("/api/logistics/<int:logistics_id>/delete", methods=["DELETE"])
 @token_required
-@role_required(1, 2)  # SuperAdmin and Admin only
+@role_required(1, 2)  # SuperAdmin and Manager only
 def delete_logistics(logistics_id):
-    """Delete logistics record (Admin and SuperAdmin only)"""
+    """Delete logistics record (Manager and SuperAdmin only)"""
     try:
         # Get logistics details for audit trail
         logistics = db.execute_one(
@@ -4773,9 +5269,9 @@ def delete_logistics(logistics_id):
 
 @app.route("/api/audit-logs", methods=["GET"])
 @token_required
-@role_required(1, 2)  # Manager, Admin only
+@role_required(1)  # SuperAdmin only
 def get_audit_logs():
-    """Get audit logs (Admin only)"""
+    """Get audit logs (SuperAdmin only)"""
     try:
         limit = request.args.get("limit", 100, type=int)
 
@@ -5061,11 +5557,11 @@ def handle_mark_read(data):
 # ==================== ANALYTICS ROUTES ====================
 
 
-@app.route("/api/analytics/admin", methods=["GET"])
+@app.route("/api/analytics/manager", methods=["GET"])
 @token_required
-@role_required(1, 2)  # Manager, Admin only
-def get_admin_analytics():
-    """Get analytics data for admin dashboard"""
+@role_required(1, 2)  # SuperAdmin, Manager only
+def get_manager_analytics():
+    """Get analytics data for manager dashboard"""
     try:
         # Students without counsellors
         students_no_counsellor = db.execute_one(
@@ -5210,7 +5706,7 @@ def get_admin_analytics():
         )
 
     except Exception as e:
-        logger.error(f"Get admin analytics error: {e}")
+        logger.error(f"Get manager analytics error: {e}")
         import traceback
 
         traceback.print_exc()
